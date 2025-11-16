@@ -1,144 +1,157 @@
 #!/usr/bin/env python3
+"""
+symlink_resolver.py
+
+Recursively scan a directory tree (or single path) for symbolic links,
+attempt to resolve each symlink following chains, detect loops, and
+report dangling links. Prints a readable table and optionally JSON.
+
+Usage:
+    python3 symlink_resolver.py /path/to/scan
+    python3 symlink_resolver.py /path/to/scan --json
+"""
+
+from __future__ import annotations
+import os
+import sys
 import argparse
 import json
-import os
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Set
+from typing import List, Tuple, Dict
 
-def resolve_symlink_chain(symlink_path: Path, max_hops: int = 100) -> Dict:
+MAX_FOLLOW = 200  # safety cap for link following
+
+def resolve_symlink(start_path: str, max_follow: int = MAX_FOLLOW) -> Dict:
     """
-    Resolve a symlink chain for `symlink_path`.
-    Returns dict with:
-      - 'chain': list of (path, is_symlink)
-      - 'resolved': absolute Path if resolution ends in an existing target else None
-      - 'broken': True if final target doesn't exist
-      - 'loop': True if loop detected
-      - 'error': error message if exception occurred
+    Attempt to resolve a symlink by following readlink targets.
+
+    Returns dict:
+      {
+        "link": <absolute path to symlink>,
+        "status": "ok" | "broken" | "loop" | "maxdepth",
+        "resolved": <final absolute target if available or last attempted>,
+        "chain": [list of intermediate absolute paths followed]
+      }
     """
-    result = {
-        "start": str(symlink_path),
-        "chain": [],
-        "resolved": None,
-        "broken": False,
-        "loop": False,
-        "error": None
-    }
-    visited: Set[str] = set()
-    current = symlink_path
-    hops = 0
+    link = os.path.abspath(start_path)
+    if not os.path.islink(link):
+        raise ValueError(f"{link} is not a symbolic link")
 
-    try:
-        while hops < max_hops:
-            hops += 1
-            is_link = current.is_symlink()
-            result["chain"].append({"path": str(current), "is_symlink": bool(is_link)})
-
-            # If not a symlink, we've reached a final node
-            if not is_link:
-                # final resolved candidate (absolute)
-                resolved_abs = current.resolve(strict=False)
-                result["resolved"] = str(resolved_abs)
-                result["broken"] = not resolved_abs.exists()
-                break
-
-            # readlink to get target as text (may be relative)
-            try:
-                raw_target = os.readlink(str(current))
-            except OSError as e:
-                # couldn't read link (permissions or weird reparse)
-                result["error"] = f"readlink error: {e}"
-                return result
-
-            # compute target path relative to current.parent
-            target_path = (current.parent / raw_target)
-
-            # canonicalize the textual form for loop detection
-            # use absolute-without-resolving to avoid exception if broken
-            canonical = str(target_path.absolute())
-            if canonical in visited:
-                result["loop"] = True
-                result["error"] = "symlink loop detected"
-                return result
-            visited.add(canonical)
-
-            # move to next
-            current = target_path
+    visited = []
+    current = link
+    for i in range(max_follow):
+        try:
+            target = os.readlink(current)  # may be relative
+        except OSError as e:
+            # readlink failed unexpectedly
+            return {"link": link, "status": "broken", "resolved": current, "chain": visited, "error": str(e)}
+        # If target is relative, interpret relative to directory containing 'current'
+        if not os.path.isabs(target):
+            current_dir = os.path.dirname(current)
+            next_path = os.path.normpath(os.path.join(current_dir, target))
+            next_path = os.path.abspath(next_path)
         else:
-            result["error"] = f"max hops ({max_hops}) reached"
-    except Exception as ex:
-        result["error"] = str(ex)
+            next_path = os.path.abspath(target)
 
-    return result
+        visited.append(next_path)
 
-def scan_tree(start: Path, follow_symlinks_dirs: bool = False) -> List[Dict]:
-    """
-    Walk the directory tree starting at `start`.
-    By default, do not follow directory symlinks during scanning (safe).
-    """
-    findings: List[Dict] = []
+        # loop detection: if we've seen this absolute path before -> loop
+        if next_path in visited[:-1]:
+            return {"link": link, "status": "loop", "resolved": next_path, "chain": visited}
 
-    # os.walk with followlinks controls whether directory symlinks are followed.
-    for dirpath, dirnames, filenames in os.walk(start, followlinks=follow_symlinks_dirs):
-        base = Path(dirpath)
-
-        # Check directories (they may be symlinks themselves)
-        for d in list(dirnames):
-            p = base / d
-            if p.is_symlink():
-                res = resolve_symlink_chain(p)
-                res.update({"type": "dir"})
-                findings.append(res)
-
-        # Check files (symlink files)
-        for f in filenames:
-            p = base / f
-            if p.is_symlink():
-                res = resolve_symlink_chain(p)
-                res.update({"type": "file"})
-                findings.append(res)
-
-    return findings
-
-def pretty_print(findings: List[Dict]):
-    print(f"Found {len(findings)} symlink(s).")
-    for idx, r in enumerate(findings, 1):
-        print("-" * 72)
-        print(f"{idx}. start: {r.get('start')}")
-        print(f"   type: {r.get('type')}")
-        if r.get("error"):
-            print(f"   ERROR: {r['error']}")
+        # if next_path is itself a symlink, continue following it
+        if os.path.islink(next_path):
+            current = next_path
             continue
-        print("   Chain:")
-        for c in r.get("chain", []):
-            mark = "-> symlink" if c.get("is_symlink") else "-> final"
-            print(f"     {c['path']} {mark}")
-        if r.get("loop"):
-            print("   LOOP detected.")
+
+        # not a symlink anymore. Check whether the file/dir exists
+        if os.path.exists(next_path):
+            return {"link": link, "status": "ok", "resolved": os.path.abspath(next_path), "chain": visited}
         else:
-            print(f"   Resolved (absolute): {r.get('resolved')}")
-            print(f"   Broken (dangling): {r.get('broken')}")
-    print("-" * 72)
+            # reached a non-symlink target that doesn't exist -> dangling
+            return {"link": link, "status": "broken", "resolved": next_path, "chain": visited}
+
+    # if we exit the loop, we exceeded max_follow
+    return {"link": link, "status": "maxdepth", "resolved": current, "chain": visited}
+
+
+def scan_tree(path: str, follow_dirs: bool = False) -> List[Dict]:
+    """
+    Recursively walk `path` and find symlinks. For each symlink found,
+    call resolve_symlink and collect results.
+
+    follow_dirs controls whether os.walk follows directory symlinks while scanning.
+    We do not follow directory symlinks by default to avoid scanning arbitrary other
+    parts of the filesystem.
+    """
+    results = []
+    # Use os.walk but avoid following dir-links unless user specifically requested it
+    for root, dirs, files in os.walk(path, followlinks=follow_dirs):
+        # examine entries in this directory using lstat to detect symlinks without following
+        entries = files + dirs
+        for name in entries:
+            full = os.path.join(root, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if os.path.islink(full):
+                try:
+                    res = resolve_symlink(full)
+                except Exception as e:
+                    res = {"link": os.path.abspath(full), "status": "error", "error": str(e), "resolved": None, "chain": []}
+                results.append(res)
+    return results
+
+
+def format_table(results: List[Dict]) -> str:
+    """
+    Produce a simple aligned text table of results.
+    """
+    lines = []
+    header = f"{'SYMLINK':<60}  {'STATUS':<8}  {'RESOLVED (final)':<60}"
+    sep = "-" * (len(header) + 10)
+    lines.append(header)
+    lines.append(sep)
+    for r in results:
+        link = r.get("link", "")
+        status = r.get("status", "")
+        resolved = r.get("resolved", "") or ""
+        lines.append(f"{link:<60}  {status:<8}  {resolved:<60}")
+        # add chain detail indented
+        chain = r.get("chain", [])
+        if chain:
+            for c in chain:
+                lines.append(f"{'':4}-> {c}")
+    return "\n".join(lines)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Resolve symlinks in a directory tree.")
-    parser.add_argument("start", nargs="?", default=".", help="Start path (default: current directory)")
-    parser.add_argument("--follow-symlinks", action="store_true",
-                        help="Follow directory symlinks while recursing (use with caution)")
-    parser.add_argument("--json", metavar="OUT", help="Write results to JSON file")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Symbolic Link Path Resolver & Validator")
+    p.add_argument("path", nargs="?", default=".", help="Path to scan (file or directory).")
+    p.add_argument("--json", action="store_true", help="Output results as JSON.")
+    p.add_argument("--follow-dirs", action="store_true", help="Let os.walk follow directory symlinks while scanning.")
+    args = p.parse_args()
 
-    start = Path(args.start).resolve()
-    if not start.exists():
-        print(f"Start path does not exist: {start}")
-        return
+    target = args.path
+    if not os.path.exists(target) and not os.path.islink(target):
+        print(f"Error: path '{target}' does not exist.", file=sys.stderr)
+        sys.exit(2)
 
-    findings = scan_tree(start, follow_symlinks_dirs=args.follow_symlinks)
-    pretty_print(findings)
+    # If target is a file path and that file is a symlink, just resolve that; otherwise scan tree
+    results = []
+    if os.path.islink(target) and not os.path.isdir(target):
+        try:
+            results = [resolve_symlink(target)]
+        except Exception as e:
+            results = [{"link": os.path.abspath(target), "status": "error", "error": str(e), "resolved": None, "chain": []}]
+    else:
+        # scan recursively
+        results = scan_tree(target, follow_dirs=args.follow_dirs)
 
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump({"start": str(start), "results": findings}, fh, indent=2)
-        print(f"Saved JSON to {args.json}")
+        print(json.dumps(results, indent=2))
+    else:
+        print(format_table(results))
 
 if __name__ == "__main__":
     main()
